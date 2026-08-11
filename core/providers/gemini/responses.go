@@ -152,7 +152,7 @@ func ToGeminiResponsesRequestWithImageURLSchemes(ctx *schemas.BifrostContext, bi
 		includeServerSideToolInvocations := bifrostReq.Params.IncludeServerSideToolInvocations != nil && *bifrostReq.Params.IncludeServerSideToolInvocations
 		// Handle tool-related parameters
 		if len(bifrostReq.Params.Tools) > 0 {
-			geminiReq.Tools, err = convertResponsesToolsToGemini(bifrostReq.Params.Tools, includeServerSideToolInvocations)
+			geminiReq.Tools, err = convertResponsesToolsToGemini(bifrostReq.Params.Tools, includeServerSideToolInvocations, bifrostReq.Provider)
 			if err != nil {
 				return nil, err
 			}
@@ -3305,14 +3305,19 @@ func (r *GeminiGenerationRequest) convertParamsToGenerationConfigResponses(param
 }
 
 // convertResponsesToolsToGemini converts Responses tools to Gemini tools.
-// includeServerSideToolInvocations opts into Gemini's tool combination mode; without it
-// Gemini rejects function declarations sent alongside Google Search, so one of the two has
-// to go. Function declarations win: they carry the caller's (or the MCP gateway's) tools,
-// which the model cannot invoke at all if they never reach the wire, whereas losing Google
-// Search only costs grounding. Set includeServerSideToolInvocations to send both.
-func convertResponsesToolsToGemini(tools []schemas.ResponsesTool, includeServerSideToolInvocations bool) ([]Tool, error) {
+// The Gemini Developer API rejects function declarations sent alongside Google Search
+// unless includeServerSideToolInvocations opts into tool combination mode, so without it
+// one of the two has to go. Function declarations win: they carry the caller's (or the MCP
+// gateway's) tools, which the model cannot invoke at all if they never reach the wire,
+// whereas losing Google Search only costs grounding.
+//
+// Vertex AI accepts the combination outright, so nothing is dropped there regardless of the
+// flag — provider distinguishes the two APIs.
+func convertResponsesToolsToGemini(tools []schemas.ResponsesTool, includeServerSideToolInvocations bool, provider schemas.ModelProvider) ([]Tool, error) {
 	var functionDeclarations []*FunctionDeclaration
 	var googleSearch *GoogleSearch
+
+	allowsMixedTools := includeServerSideToolInvocations || provider == schemas.Vertex
 
 	hasFunctionTool := false
 
@@ -3323,7 +3328,7 @@ func convertResponsesToolsToGemini(tools []schemas.ResponsesTool, includeServerS
 		}
 	}
 
-	dropGoogleSearch := hasFunctionTool && !includeServerSideToolInvocations
+	dropGoogleSearch := hasFunctionTool && !allowsMixedTools
 
 	for _, tool := range tools {
 		if tool.Type == schemas.ResponsesToolTypeFunction {
