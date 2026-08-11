@@ -32,6 +32,10 @@ const (
 	// before it is worth a write. Cache sizes drift a little every turn, and
 	// persisting each drift would put a cluster broadcast back on every request.
 	sessionObservationChangeRatio = 0.1
+
+	complexitySessionTierSourceClassified = "classified"
+	complexitySessionTierSourceMemoised   = "memoised"
+	complexitySessionTierSourceHeld       = "held"
 )
 
 var (
@@ -385,7 +389,8 @@ func (p *GovernancePlugin) classifyWithPinnedSession(
 	}
 
 	result := classify()
-	p.persistInitialSessionTier(ctx, store, state, result)
+	switchCount, switchCountKnown := p.persistInitialSessionTier(ctx, store, state, result)
+	publishSessionClassificationTelemetry(ctx, state, result, switchCount, switchCountKnown)
 	return result
 }
 
@@ -397,12 +402,16 @@ func (p *GovernancePlugin) classifyWithCacheAwareSession(
 ) *complexity.ComplexityResult {
 	proposed := classify()
 	var decision sessionTierDecision
+	var switchCount int
+	var switchCountKnown bool
 	decisionTime := time.Now()
 	_, found, err := store.Update(ctx, state.Key, state.Config.TTL, func(current *SessionComplexityRecord) error {
 		decision = updateSessionTierRecord(current, proposed, &state.Config, decisionTime)
 		if decision.Reason == sessionTierReasonInvalidState {
 			return errInvalidComplexitySession
 		}
+		switchCount = current.SwitchCount
+		switchCountKnown = true
 		if !decision.RecordChanged {
 			return errSessionTierDecisionUnchanged
 		}
@@ -421,16 +430,18 @@ func (p *GovernancePlugin) classifyWithCacheAwareSession(
 		if p.logger != nil {
 			p.logger.Warn("[Governance] Complexity session update failed, using this turn's classification: %v", err)
 		}
+		publishSessionClassificationTelemetry(ctx, state, proposed, 0, false)
 		return proposed
 	}
 	if !found {
 		// Update found no live record. Treat this request as a new session rather
 		// than trying to apply switching policy without a held tier.
-		p.persistInitialSessionTier(ctx, store, state, proposed)
+		switchCount, switchCountKnown = p.persistInitialSessionTier(ctx, store, state, proposed)
+		publishSessionClassificationTelemetry(ctx, state, proposed, switchCount, switchCountKnown)
 		return proposed
 	}
 
-	p.publishCacheAwareSessionTier(ctx, state, proposed, decision)
+	p.publishCacheAwareSessionTier(ctx, state, proposed, decision, switchCount, switchCountKnown)
 	return complexityResultForSessionDecision(proposed, decision)
 }
 
@@ -442,9 +453,9 @@ func (p *GovernancePlugin) persistInitialSessionTier(
 	store SessionStore,
 	state *complexitySessionState,
 	result *complexity.ComplexityResult,
-) {
+) (switchCount int, known bool) {
 	if result == nil || result.Tier == "" {
-		return
+		return 0, false
 	}
 
 	// RuleID is deliberately left unset. The tier is classifier memory about
@@ -459,7 +470,7 @@ func (p *GovernancePlugin) persistInitialSessionTier(
 		if p.logger != nil {
 			p.logger.Warn("[Governance] Failed to persist complexity session tier; session policy will retry later: %v", err)
 		}
-		return
+		return 0, false
 	}
 	if created {
 		ctx.AppendRoutingEngineLog(
@@ -467,7 +478,11 @@ func (p *GovernancePlugin) persistInitialSessionTier(
 			schemas.LogLevelInfo,
 			"Complexity session established: tier="+result.Tier+" identity="+state.Source,
 		)
+		return 0, true
 	}
+	// Another request won the create race. Its stored switch count is not known
+	// without another read, and observability is not worth an extra store call.
+	return 0, false
 }
 
 // publishPinnedSessionTier records a reused tier with a mechanism that makes it
@@ -479,6 +494,7 @@ func (p *GovernancePlugin) publishPinnedSessionTier(
 ) {
 	ctx.SetValue(schemas.BifrostContextKeyGovernanceComplexityTier, record.Tier)
 	ctx.SetValue(schemas.BifrostContextKeyGovernanceComplexityMechanism, complexity.MechanismSession)
+	publishComplexitySessionLogContext(ctx, state, complexitySessionTierSourceMemoised, record.SwitchCount, true)
 	if p.logger != nil {
 		p.logger.Debug("[Governance] Complexity session hit: tier=%s identity=%s", record.Tier, state.Source)
 	}
@@ -499,11 +515,18 @@ func (p *GovernancePlugin) publishCacheAwareSessionTier(
 	state *complexitySessionState,
 	proposed *complexity.ComplexityResult,
 	decision sessionTierDecision,
+	switchCount int,
+	switchCountKnown bool,
 ) {
 	ctx.SetValue(schemas.BifrostContextKeyGovernanceComplexityTier, decision.Tier)
 	if proposed == nil || proposed.Tier != decision.Tier {
 		ctx.ClearValue(schemas.BifrostContextKeyGovernanceComplexityScore)
 	}
+	tierSource := complexitySessionTierSourceHeld
+	if proposed != nil && proposed.Tier == decision.Tier {
+		tierSource = complexitySessionTierSourceClassified
+	}
+	publishComplexitySessionLogContext(ctx, state, tierSource, switchCount, switchCountKnown)
 
 	proposedTier := "none"
 	if proposed != nil && proposed.Tier != "" {
@@ -521,6 +544,56 @@ func (p *GovernancePlugin) publishCacheAwareSessionTier(
 		p.logger.Debug("[Governance] %s", message)
 	}
 	ctx.AppendRoutingEngineLog(schemas.RoutingEngineRoutingRule, schemas.LogLevelInfo, message)
+}
+
+// publishSessionClassificationTelemetry records a turn whose routing outcome
+// came directly from this turn's classifier, either because the session is new
+// or because the store failed open. The switch count stays absent unless this
+// request successfully created the initial record.
+func publishSessionClassificationTelemetry(
+	ctx *schemas.BifrostContext,
+	state *complexitySessionState,
+	result *complexity.ComplexityResult,
+	switchCount int,
+	switchCountKnown bool,
+) {
+	tierSource := ""
+	if result != nil && result.Tier != "" {
+		tierSource = complexitySessionTierSourceClassified
+	}
+	publishComplexitySessionLogContext(ctx, state, tierSource, switchCount, switchCountKnown)
+}
+
+// publishComplexitySessionLogContext exposes small, request-local facts for the
+// logging plugin. The identifier hashes the already tenant-namespaced store key
+// again, yielding one opaque value without exposing the raw caller, harness, or
+// fingerprint identity—or the separately hashed tenant component in the key.
+//
+// This is invoked only from the lazy complexity closure. Merely enabling
+// sessions therefore adds no log fields to requests whose rules never inspect
+// complexity_tier.
+func publishComplexitySessionLogContext(
+	ctx *schemas.BifrostContext,
+	state *complexitySessionState,
+	tierSource string,
+	switchCount int,
+	switchCountKnown bool,
+) {
+	if ctx == nil || state == nil || state.Key == "" {
+		return
+	}
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceComplexitySessionID, complexitySessionHash(state.Key))
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceComplexitySessionMode, state.Config.Mode)
+	if tierSource == "" {
+		ctx.ClearValue(schemas.BifrostContextKeyGovernanceComplexitySessionTierSource)
+	} else {
+		ctx.SetValue(schemas.BifrostContextKeyGovernanceComplexitySessionTierSource, tierSource)
+	}
+	if switchCountKnown {
+		ctx.SetValue(schemas.BifrostContextKeyGovernanceComplexitySessionSwitchCount, switchCount)
+	} else {
+		ctx.ClearValue(schemas.BifrostContextKeyGovernanceComplexitySessionSwitchCount)
+	}
 }
 
 func complexityResultForSessionDecision(

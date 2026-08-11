@@ -32,6 +32,24 @@ func TestShouldUseFilterDataCacheAllowsUnscopedEmptyQuery(t *testing.T) {
 	}
 }
 
+func TestParseComplexityFiltersIncludesSessionDimensions(t *testing.T) {
+	ctx := &fasthttp.RequestCtx{}
+	ctx.QueryArgs().Set("complexity_tiers", "SIMPLE,COMPLEX")
+	ctx.QueryArgs().Set("complexity_mechanisms", "semantic,session")
+	ctx.QueryArgs().Set("complexity_session_modes", "pinned,cache_aware")
+	ctx.QueryArgs().Set("complexity_session_tier_sources", "classified,held")
+	filters := &logstore.SearchFilters{}
+
+	parseComplexityFilters(ctx, filters)
+
+	if len(filters.ComplexitySessionModes) != 2 || filters.ComplexitySessionModes[0] != "pinned" || filters.ComplexitySessionModes[1] != "cache_aware" {
+		t.Fatalf("unexpected session modes: %#v", filters.ComplexitySessionModes)
+	}
+	if len(filters.ComplexitySessionTierSources) != 2 || filters.ComplexitySessionTierSources[0] != "classified" || filters.ComplexitySessionTierSources[1] != "held" {
+		t.Fatalf("unexpected session tier sources: %#v", filters.ComplexitySessionTierSources)
+	}
+}
+
 // TestShouldUseFilterDataCacheRejectsSearchQuery verifies search requests are
 // request-specific and must not share the empty-query cache.
 func TestShouldUseFilterDataCacheRejectsSearchQuery(t *testing.T) {

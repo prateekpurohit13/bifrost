@@ -38,7 +38,7 @@ import {
 	RoutingEngineUsedLabels,
 	Status,
 } from "@/lib/constants/logs";
-import { COMPLEXITY_MECHANISM_LABELS } from "@/lib/types/complexityRouter";
+import { COMPLEXITY_MECHANISM_LABELS, COMPLEXITY_SESSION_TIER_SOURCE_LABELS, SESSION_MODE_LABELS } from "@/lib/types/complexityRouter";
 import { ContentBlock, LogEntry, ResponsesMessage } from "@/lib/types/logs";
 import { useGetUserAgentMappingsQuery } from "@/lib/store";
 import { cn } from "@/lib/utils";
@@ -1349,6 +1349,35 @@ export function LogDetailView({
 							)}
 							{complexityRouting.score !== undefined && (
 								<LogEntryDetailsView className="w-full" label="Complexity Score" value={complexityRouting.score.toFixed(2)} />
+							)}
+							{log.complexity_session_id && (
+								<LogEntryDetailsView
+									className="w-full"
+									label="Complexity Session ID"
+									value={
+										<span className="flex min-w-0 items-center gap-1">
+											<code className="min-w-0 font-mono text-xs break-all">{log.complexity_session_id}</code>
+											<CopyInlineButton text={log.complexity_session_id} testId="logdetails-copy-complexity-session-id-button" />
+										</span>
+									}
+								/>
+							)}
+							{log.complexity_session_mode && (
+								<LogEntryDetailsView
+									className="w-full"
+									label="Complexity Session Mode"
+									value={SESSION_MODE_LABELS[log.complexity_session_mode] ?? log.complexity_session_mode}
+								/>
+							)}
+							{log.complexity_session_tier_source && (
+								<LogEntryDetailsView
+									className="w-full"
+									label="Session Tier Source"
+									value={COMPLEXITY_SESSION_TIER_SOURCE_LABELS[log.complexity_session_tier_source] ?? log.complexity_session_tier_source}
+								/>
+							)}
+							{log.complexity_session_switch_count !== undefined && (
+								<LogEntryDetailsView className="w-full" label="Session Tier Switches" value={log.complexity_session_switch_count} />
 							)}
 
 							{(log.params as any)?.audio && (

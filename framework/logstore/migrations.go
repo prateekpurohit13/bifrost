@@ -295,6 +295,7 @@ var logstoreMigrationSteps = []migrationStep{
 	{IDs: []string{"mcp_tool_logs_add_endpoint_columns"}, run: migrationAddEndpointColumnsToMCPToolLogs},
 	{IDs: []string{"mcp_tool_logs_add_plugin_logs_column"}, run: migrationAddMCPPluginLogsColumn},
 	{IDs: []string{"logs_add_complexity_routing_columns"}, run: migrationAddComplexityRoutingColumns},
+	{IDs: []string{"logs_add_complexity_session_columns"}, run: migrationAddComplexitySessionColumns},
 }
 
 // areThereAnyPendingMigrations returns true if there are any pending migrations to be applied.
@@ -2693,6 +2694,16 @@ var performanceIndexes = []performanceIndexDef{
 		sql:   "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_complexity_mechanism ON logs(complexity_mechanism) WHERE complexity_mechanism IS NOT NULL",
 	},
 	{
+		table: "logs",
+		name:  "idx_logs_complexity_session_mode",
+		sql:   "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_complexity_session_mode ON logs(complexity_session_mode) WHERE complexity_session_mode IS NOT NULL",
+	},
+	{
+		table: "logs",
+		name:  "idx_logs_complexity_session_tier_source",
+		sql:   "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_complexity_session_tier_source ON logs(complexity_session_tier_source) WHERE complexity_session_tier_source IS NOT NULL",
+	},
+	{
 		table: "mcp_tool_logs",
 		name:  "idx_mcp_logs_user_id",
 		sql:   "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_mcp_logs_user_id ON mcp_tool_logs(user_id)",
@@ -3640,6 +3651,54 @@ func migrationAddComplexityRoutingColumns(ctx context.Context, db *gorm.DB, logg
 	}})
 	if err := m.Migrate(); err != nil {
 		return fmt.Errorf("error while adding complexity routing columns: %s", err.Error())
+	}
+	return nil
+}
+
+// migrationAddComplexitySessionColumns adds nullable request-log fields for
+// session-aware complexity decisions. The session ID is intentionally not
+// indexed: it supports display and export, not conversation lookup. The
+// existing background index reconciler builds partial indexes for the two
+// low-cardinality filter fields after these columns exist.
+func migrationAddComplexitySessionColumns(ctx context.Context, db *gorm.DB, logger schemas.Logger) error {
+	migrationName := "logs_add_complexity_session_columns"
+	logger.Info("[logstore] starting migration %s", migrationName)
+	defer logger.Info("[logstore] finished migration %s", migrationName)
+	opts := *migrator.DefaultOptions
+	opts.UseTransaction = true
+	m := migrator.New(db, &opts, []*migrator.Migration{{
+		ID: migrationName,
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			for _, field := range []string{
+				"complexity_session_id",
+				"complexity_session_mode",
+				"complexity_session_tier_source",
+				"complexity_session_switch_count",
+			} {
+				if err := addColumnIfNotExists(tx, logger, &Log{}, field); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			for _, field := range []string{
+				"complexity_session_switch_count",
+				"complexity_session_tier_source",
+				"complexity_session_mode",
+				"complexity_session_id",
+			} {
+				if err := dropColumnIfExists(tx, logger, &Log{}, field); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}})
+	if err := m.Migrate(); err != nil {
+		return fmt.Errorf("error while adding complexity session columns: %s", err.Error())
 	}
 	return nil
 }
